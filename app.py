@@ -3,19 +3,19 @@ import io
 import binascii
 import hashlib
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 
-# cryptography para X.509 y PKCS#7 (bundles p7b/p7s -> extraer certificados)
+# X.509 y PKCS#7 (extractor de certificados de bundles .p7b/.p7s)
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.serialization import pkcs7
+from cryptography.x509.oid import ExtendedKeyUsageOID as EKUOID
 
-# asn1crypto para parsear tokens RFC 3161 (TSR/TST) y CMS
-from asn1crypto import tsp, cms  # noqa: E402
-
+# RFC 3161 (TSR/TST) y CMS con asn1crypto
+from asn1crypto import tsp, cms, x509 as a_x509
 
 # ================= Configuración =================
 st.set_page_config(
@@ -24,18 +24,39 @@ st.set_page_config(
     layout="wide"
 )
 
-# ================= Utilidades comunes =================
+# ================= Utilidades =================
 def sha256_hex(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
-def _dt_iso_utc(dt) -> str:
-    """Devuelve datetime en ISO-8601 UTC, tolerando naive/aware."""
+def dt_iso_utc(dt) -> str:
+    """Convierte cualquier datetime a ISO-8601 en UTC (tolerando naive/aware)."""
     try:
         if getattr(dt, "tzinfo", None) is None:
             return dt.replace(tzinfo=timezone.utc).isoformat()
         return dt.astimezone(timezone.utc).isoformat()
     except Exception:
         return str(dt)
+
+def cert_validity_iso(cert: x509.Certificate) -> Tuple[str, str]:
+    """
+    Devuelve (not_before_iso, not_after_iso) en UTC con compatibilidad
+    entre cryptography >=42 (propiedades *_utc) y <42 (naive).
+    """
+    try:
+        nvb = cert.not_valid_before_utc
+        nva = cert.not_valid_after_utc
+    except AttributeError:
+        # Fallback para versiones antiguas: pueden devolver naive
+        nvb = getattr(cert, "not_valid_before", None)
+        nva = getattr(cert, "not_valid_after", None)
+        if nvb is not None and nvb.tzinfo is None:
+            nvb = nvb.replace(tzinfo=timezone.utc)
+        if nva is not None and nva.tzinfo is None:
+            nva = nva.replace(tzinfo=timezone.utc)
+    return (
+        nvb.isoformat() if nvb is not None else "—",
+        nva.isoformat() if nva is not None else "—",
+    )
 
 def _try_load_x509_cert(cert_bytes: bytes) -> Optional[x509.Certificate]:
     """Carga un certificado X.509 desde PEM o DER."""
@@ -51,7 +72,7 @@ def _try_load_x509_cert(cert_bytes: bytes) -> Optional[x509.Certificate]:
 def _try_load_pkcs7_bundle(bundle_bytes: bytes) -> List[x509.Certificate]:
     """
     Carga un bundle PKCS#7 (.p7b/.p7s) y devuelve la lista de certificados incluidos.
-    (No realiza verificación criptográfica del contenido firmado).
+    (No realiza verificación criptográfica de contenido firmado, cadena ni revocación).
     """
     # DER
     try:
@@ -68,7 +89,7 @@ def _try_load_pkcs7_bundle(bundle_bytes: bytes) -> List[x509.Certificate]:
         return []
 
 def _name_to_dict(name: x509.Name) -> Dict[str, str]:
-    """Convierte un x509.Name en dict sencillo para mostrar."""
+    """Convierte un x509.Name en dict legible."""
     out: Dict[str, str] = {}
     for rdn in name.rdns:
         for attr in rdn:
@@ -79,6 +100,7 @@ def _bytes_to_hex(b: bytes) -> str:
     return binascii.hexlify(b).decode("ascii")
 
 def _safe_get_native(asn1_obj, path: List[str], default=None):
+    """Acceso seguro a rutas en estructuras ASN.1 de asn1crypto."""
     try:
         cur = asn1_obj
         for p in path:
@@ -87,10 +109,37 @@ def _safe_get_native(asn1_obj, path: List[str], default=None):
     except Exception:
         return default
 
+def _asn1_certs_to_cryptography_list(certs_seq) -> List[x509.Certificate]:
+    """
+    Convierte una secuencia asn1crypto de CertificateChoices a objetos cryptography.x509.Certificate.
+    Ignora entradas que no sean 'certificate'.
+    """
+    out: List[x509.Certificate] = []
+    if certs_seq is None:
+        return out
+    try:
+        for c in certs_seq:
+            if c.name == "certificate":
+                der = c.chosen.dump()
+                out.append(x509.load_der_x509_certificate(der))
+    except Exception:
+        pass
+    return out
+
+def _has_eku_time_stamping(pycert: x509.Certificate) -> bool:
+    """Devuelve True si el certificado tiene EKU timeStamping (1.3.6.1.5.5.7.3.8)."""
+    try:
+        eku = pycert.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
+        for oid in eku:
+            if oid.dotted_string == EKUOID.TIME_STAMPING.dotted_string:
+                return True
+    except Exception:
+        return False
+    return False
 
 # ================= Contenido didáctico =================
 st.title("UD2 — Firmas digitales y sellado de tiempo")
-st.caption("Conceptos: certificado digital, clave pública, PKI · Lecturas: ETSI EN 319 411-1; AEPD (2018) · Actividad: análisis de firma X.509")
+st.caption("Certificado digital, clave pública, PKI · Lecturas: ETSI EN 319 411-1; AEPD (2018) · Actividad: análisis de firma X.509")
 
 tabs = st.tabs([
     "📚 Teoría guiada",
@@ -184,10 +233,11 @@ with tabs[2]:
                 st.code(hex(cert.serial_number), language="text")
 
             with colB:
-                st.write("**Validez**")
+                st.write("**Validez (UTC)**")
+                nb_iso, na_iso = cert_validity_iso(cert)
                 st.json({
-                    "not_before_utc": _dt_iso_utc(cert.not_valid_before),
-                    "not_after_utc": _dt_iso_utc(cert.not_valid_after)
+                    "not_before_utc": nb_iso,
+                    "not_after_utc":  na_iso
                 }, expanded=False)
                 st.write("**Algoritmo de firma**")
                 try:
@@ -246,7 +296,7 @@ with tabs[2]:
             except Exception:
                 add_row("SubjectAltName", "—")
 
-            # Authority Information Access (AIA)
+            # AIA
             try:
                 aia = cert.extensions.get_extension_for_class(x509.AuthorityInformationAccess).value
                 desc = []
@@ -258,7 +308,7 @@ with tabs[2]:
             except Exception:
                 add_row("AIA", "—")
 
-            # CRL Distribution Points
+            # CRL Dist Points
             try:
                 crl = cert.extensions.get_extension_for_class(x509.CRLDistributionPoints).value
                 urls = []
@@ -288,12 +338,13 @@ with tabs[2]:
                     ca_flag = c.extensions.get_extension_for_class(x509.BasicConstraints).value.ca
                 except Exception:
                     ca_flag = False
+                nb_iso, na_iso = cert_validity_iso(c)
                 data.append({
                     "idx": idx,
                     "Subject CN": _name_to_dict(c.subject).get("commonName", "—"),
                     "Issuer CN": _name_to_dict(c.issuer).get("commonName", "—"),
-                    "Válido desde": _dt_iso_utc(c.not_valid_before),
-                    "Válido hasta": _dt_iso_utc(c.not_valid_after),
+                    "Válido desde": nb_iso,
+                    "Válido hasta": na_iso,
                     "SHA-256": c.fingerprint(hashes.SHA256()).hex()[:32] + "…",
                     "CA?": ca_flag
                 })
@@ -312,6 +363,25 @@ with tabs[3]:
     with colR:
         st.markdown("**Acciones**")
         go = st.button("Analizar token")
+
+    # ---- Validación opcional (docente) ----
+    st.markdown("### Validación opcional (docente)")
+    with st.expander("Configurar política y requisitos", expanded=False):
+        wl_default = "1.2.3.4.1.2345.1"  # Ejemplo de OID demo
+        wl_str = st.text_input(
+            "Lista blanca de Policy OIDs (separados por comas)",
+            value=wl_default,
+            help="Introduce OIDs de políticas de sello que aceptas como 'válidas' a efectos didácticos."
+        )
+        require_eku = st.checkbox(
+            "Exigir EKU timeStamping en el certificado firmante del token",
+            value=True,
+            help="Comprueba que el certificado firmante declara Extended Key Usage 'timeStamping' (1.3.6.1.5.5.7.3.8)."
+        )
+        label_qualified = st.checkbox(
+            "Marcar como «cualificado (didáctico)» si política/ekus cumplen",
+            value=True
+        )
 
     def _parse_tsr(tsr_bytes: bytes) -> Dict[str, Any]:
         """Devuelve un dict con campos clave de un TimeStampResp (RFC 3161)."""
@@ -332,14 +402,15 @@ with tabs[3]:
 
         sd = ci["content"]
         eci = sd["encap_content_info"]
-        # TSTInfo va encapsulado como content
-        tst_info = eci["content"].parsed  # asn1crypto lo parsea automáticamente
+        # TSTInfo va encapsulado como content; asn1crypto lo parsea automáticamente
+        tst_info = eci["content"].parsed
 
         # Campos clave de TSTInfo
         mi = tst_info["message_imprint"]
         out["hash_algorithm"] = mi["hash_algorithm"]["algorithm"].native
         out["message_imprint"] = _bytes_to_hex(mi["hashed_message"].native)
-        out["gen_time_utc"] = _safe_get_native(tst_info, ["gen_time"]).replace(tzinfo=timezone.utc).isoformat()
+        gen_time = _safe_get_native(tst_info, ["gen_time"])
+        out["gen_time_utc"] = dt_iso_utc(gen_time) if gen_time else "—"
         out["serial_number"] = tst_info["serial_number"].native
         out["policy_oid"] = tst_info["policy"].dotted
         out["ordering"] = _safe_get_native(tst_info, ["ordering"], False)
@@ -349,15 +420,25 @@ with tabs[3]:
         out["tsa_name"] = str(tsa_gn) if tsa_gn is not None else "—"
 
         # Certificados del SignedData (si están embebidos)
+        certs_seq = _safe_get_native(sd, ["certificates"], None)
         out["signer_subjects"] = []
-        certs = _safe_get_native(sd, ["certificates"], [])
+        out["embedded_certs_count"] = 0
+        out["eku_time_stamping_present"] = None
+
         try:
-            for c in certs:
-                if c.name == "certificate":
-                    subject = c.chosen.subject.human_friendly
-                    out["signer_subjects"].append(subject)
+            # Extrae 'subject' legible con asn1crypto
+            if certs_seq is not None:
+                for c in sd["certificates"]:
+                    if c.name == "certificate":
+                        out["signer_subjects"].append(c.chosen.subject.human_friendly)
+                out["embedded_certs_count"] = len(out["signer_subjects"])
         except Exception:
             pass
+
+        # EKU check con cryptography (más simple y robusto)
+        pycerts = _asn1_certs_to_cryptography_list(sd["certificates"] if "certificates" in sd.native else None)
+        if pycerts:
+            out["eku_time_stamping_present"] = any(_has_eku_time_stamping(pc) for pc in pycerts)
 
         return out
 
@@ -384,18 +465,30 @@ with tabs[3]:
                     if ci["content_type"].native == "signed_data":
                         sd = ci["content"]
                         eci = sd["encap_content_info"]
+                        parsed = {"status": "granted", "note": "PKCS#7 con SignedData"}
                         if eci["content_type"].native in ("tst_info", "data"):
-                            parsed = {"status": "granted", "note": "PKCS#7 con SignedData"}
                             try:
                                 ti = eci["content"].parsed
                                 if ti.name == "TSTInfo":
                                     mi = ti["message_imprint"]
                                     parsed["hash_algorithm"] = mi["hash_algorithm"]["algorithm"].native
                                     parsed["message_imprint"] = _bytes_to_hex(mi["hashed_message"].native)
-                                    parsed["gen_time_utc"] = _safe_get_native(ti, ["gen_time"]).replace(tzinfo=timezone.utc).isoformat()
+                                    g = _safe_get_native(ti, ["gen_time"])
+                                    parsed["gen_time_utc"] = dt_iso_utc(g) if g else "—"
                                     parsed["policy_oid"] = ti["policy"].dotted
                             except Exception:
                                 pass
+                        # EKU (si el P7S trae certificados)
+                        try:
+                            pycerts = _asn1_certs_to_cryptography_list(sd["certificates"])
+                            if pycerts:
+                                parsed["eku_time_stamping_present"] = any(_has_eku_time_stamping(pc) for pc in pycerts)
+                                parsed["signer_subjects"] = []
+                                for c in sd["certificates"]:
+                                    if c.name == "certificate":
+                                        parsed.setdefault("signer_subjects", []).append(c.chosen.subject.human_friendly)
+                        except Exception:
+                            pass
                         ok = True
                 except Exception as e:
                     error = f"PKCS#7 parse error: {e}"
@@ -403,8 +496,59 @@ with tabs[3]:
             if not ok and error:
                 st.error(error)
             elif parsed:
+                # --- Validaciones didácticas ---
+                whitelist = [o.strip() for o in wl_str.split(",") if o.strip()]
+                policy_ok = None
+                if "policy_oid" in parsed and parsed["policy_oid"]:
+                    policy_ok = parsed["policy_oid"] in whitelist if whitelist else None
+
+                eku_ok = parsed.get("eku_time_stamping_present", None)
+                qualifies = False
+                if label_qualified:
+                    # Etiquetamos como "cualificado (didáctico)" si:
+                    #  - la policy está en lista blanca (si se definió)
+                    #  - y, si se exige, el certificado trae EKU timeStamping
+                    cond_policy = (policy_ok is True) if whitelist else True  # si no hay WL, no bloquea
+                    cond_eku = (eku_ok is True) if require_eku else True
+                    qualifies = cond_policy and cond_eku
+
                 st.markdown("### Resultado del token")
                 st.json(parsed, expanded=False)
+
+                # Resumen de validación (docente)
+                with st.container():
+                    st.markdown("### Validación (docente)")
+                    cols = st.columns(3)
+                    with cols[0]:
+                        if whitelist:
+                            if policy_ok is True:
+                                st.success(f"Policy OID aceptada ✅\n\n`{parsed.get('policy_oid','—')}`")
+                            elif policy_ok is False:
+                                st.error(f"Policy OID fuera de lista ❌\n\n`{parsed.get('policy_oid','—')}`")
+                            else:
+                                st.info("Sin Policy OID o no detectable")
+                        else:
+                            st.caption("Sin lista blanca de políticas: no se filtra por Policy OID.")
+
+                    with cols[1]:
+                        if require_eku:
+                            if eku_ok is True:
+                                st.success("EKU timeStamping presente ✅")
+                            elif eku_ok is False:
+                                st.error("EKU timeStamping ausente ❌")
+                            else:
+                                st.info("No se pudo determinar EKU")
+                        else:
+                            st.caption("EKU no exigido.")
+
+                    with cols[2]:
+                        if label_qualified:
+                            if qualifies:
+                                st.success("Etiqueta: **cualificado (didáctico)** ✅")
+                            else:
+                                st.warning("Etiqueta: **no cualificado (didáctico)**")
+                        else:
+                            st.caption("Etiquetado didáctico desactivado.")
 
                 # Verificación contra documento (si se subió)
                 if src_doc and parsed.get("message_imprint"):
@@ -428,7 +572,10 @@ with tabs[3]:
                     else:
                         st.error("❌ No coincide el imprint: el token no sella este documento.")
 
-                st.caption("Aviso docente: no se valida cadena de confianza ni estado de revocación de la TSA.")
+                st.caption(
+                    "Aviso docente: no se valida cadena de confianza (CA), identidad de TSA, ni estado de revocación. "
+                    "La lista blanca y el EKU son filtros **didácticos** para discutir políticas y perfiles."
+                )
 
 # --------- Autoevaluación ---------
 with tabs[4]:
@@ -476,19 +623,21 @@ with tabs[5]:
     st.subheader("Glosario breve")
     glos = pd.DataFrame({
         "Término": [
-            "PKI", "X.509", "KeyUsage", "EKU", "AIA/CRL/OCSP", "TSA", "RFC 3161", "Imprint"
+            "PKI", "X.509", "KeyUsage", "EKU", "AIA/CRL/OCSP", "TSA", "RFC 3161", "Imprint", "Policy OID"
         ],
         "Definición": [
             "Infraestructura de Clave Pública: CA/RA/políticas y dispositivos.",
             "Formato estándar de certificados digitales.",
             "Extensión que limita usos de la clave.",
-            "Usos extendidos: serverAuth, emailProtection, etc.",
+            "Usos extendidos: serverAuth, emailProtection, timeStamping, etc.",
             "Servicios de información y revocación del emisor.",
             "Autoridad de Sellado de Tiempo.",
             "Especificación técnica del sellado de tiempo.",
-            "Huella hash del objeto que se sella."
+            "Huella hash del objeto que se sella.",
+            "Identificador de política aplicable al sello/certificado."
         ]
     })
     st.dataframe(glos, width="stretch")
 
-    st.caption("Herramienta **docente**: no sustituye validaciones cualificadas ni políticas de confianza institucionales.")
+    st.caption("Herramienta **docente**: no sustituye validaciones cualificadas, políticas de confianza ni verificaciones de revocación.")
+
