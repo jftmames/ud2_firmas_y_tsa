@@ -1,4 +1,12 @@
 # -*- coding: utf-8 -*-
+"""
+UD2 — Firmas digitales y sellado de tiempo (Streamlit)
+Incluye:
+ - Analizador X.509 (cert individual y bundle PKCS#7)
+ - Analizador de sello de tiempo (RFC 3161 / PKCS#7)
+ - Validación didáctica por Policy OID + EKU timeStamping
+ - Parche de parsing PKCS#7 tolerante a BER con asn1crypto (sin warnings)
+"""
 import io
 import binascii
 import hashlib
@@ -15,7 +23,7 @@ from cryptography.hazmat.primitives.serialization import pkcs7
 from cryptography.x509.oid import ExtendedKeyUsageOID as EKUOID
 
 # RFC 3161 (TSR/TST) y CMS con asn1crypto
-from asn1crypto import tsp, cms, x509 as a_x509
+from asn1crypto import tsp, cms, x509 as a_x509, pem  # añadimos pem para detectar PEM
 
 # ================= Configuración =================
 st.set_page_config(
@@ -69,25 +77,6 @@ def _try_load_x509_cert(cert_bytes: bytes) -> Optional[x509.Certificate]:
     except Exception:
         return None
 
-def _try_load_pkcs7_bundle(bundle_bytes: bytes) -> List[x509.Certificate]:
-    """
-    Carga un bundle PKCS#7 (.p7b/.p7s) y devuelve la lista de certificados incluidos.
-    (No realiza verificación criptográfica de contenido firmado, cadena ni revocación).
-    """
-    # DER
-    try:
-        certs = pkcs7.load_der_pkcs7_certificates(bundle_bytes)
-        if certs:
-            return certs
-    except Exception:
-        pass
-    # PEM
-    try:
-        certs = pkcs7.load_pem_pkcs7_certificates(bundle_bytes)
-        return certs or []
-    except Exception:
-        return []
-
 def _name_to_dict(name: x509.Name) -> Dict[str, str]:
     """Convierte un x509.Name en dict legible."""
     out: Dict[str, str] = {}
@@ -136,6 +125,62 @@ def _has_eku_time_stamping(pycert: x509.Certificate) -> bool:
     except Exception:
         return False
     return False
+
+# --------- Parche PKCS#7 tolerante a BER (evita el warning de cryptography) ---------
+def _pkcs7_extract_certs_asn1(p7_bytes: bytes) -> List[x509.Certificate]:
+    """
+    Lee un PKCS#7 (.p7b/.p7s) en BER o DER con asn1crypto (tolerante),
+    extrae certificados como DER y los carga con cryptography.x509.
+    """
+    certs: List[x509.Certificate] = []
+    try:
+        # Si viene en PEM, lo pasamos a DER
+        if pem.detect(p7_bytes):
+            _type, _headers, der = pem.unarmor(p7_bytes)
+        else:
+            der = p7_bytes
+
+        ci = cms.ContentInfo.load(der)  # asn1crypto soporta BER/DER
+        if ci["content_type"].native != "signed_data":
+            return []
+
+        sd = ci["content"]
+        cert_seq = sd["certificates"]
+        if cert_seq is None:
+            return []
+
+        for c in cert_seq:
+            if c.name == "certificate":
+                der_cert = c.chosen.dump()  # DER limpio
+                certs.append(x509.load_der_x509_certificate(der_cert))
+    except Exception:
+        return []
+    return certs
+
+def _try_load_pkcs7_bundle(bundle_bytes: bytes) -> List[x509.Certificate]:
+    """
+    Intenta extraer certificados de un PKCS#7 (BER/DER/PEM).
+    1) asn1crypto (BER/DER, sin warnings)
+    2) cryptography pkcs7 DER
+    3) cryptography pkcs7 PEM
+    """
+    # Paso 1: asn1crypto (preferido; evita el warning)
+    certs = _pkcs7_extract_certs_asn1(bundle_bytes)
+    if certs:
+        return certs
+
+    # Paso 2–3: fallbacks clásicos
+    try:
+        certs = pkcs7.load_der_pkcs7_certificates(bundle_bytes)
+        if certs:
+            return certs
+    except Exception:
+        pass
+    try:
+        certs = pkcs7.load_pem_pkcs7_certificates(bundle_bytes)
+        return certs or []
+    except Exception:
+        return []
 
 # ================= Contenido didáctico =================
 st.title("UD2 — Firmas digitales y sellado de tiempo")
@@ -640,4 +685,5 @@ with tabs[5]:
     st.dataframe(glos, width="stretch")
 
     st.caption("Herramienta **docente**: no sustituye validaciones cualificadas, políticas de confianza ni verificaciones de revocación.")
+
 
